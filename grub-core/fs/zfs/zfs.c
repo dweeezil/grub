@@ -1081,7 +1081,8 @@ check_pool_label (struct grub_zfs_data *data,
 
   grub_dprintf ("zfs", "check 11 passed\n");
 
-  if (data->mounted && data->guid != poolguid)
+  if ((data->mounted && data->guid != poolguid)
+   || (data->guid && data->guid != poolguid))
     return grub_error (GRUB_ERR_BAD_FS, "another zpool");
   else
     data->guid = poolguid;
