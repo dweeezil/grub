@@ -281,7 +281,9 @@ grub_crypto_cipher_handle_t (*grub_zfs_load_key) (const struct grub_zfs_key *key
 #define MAX_SUPPORTED_FEATURE_STRLEN 50
 static const char *spa_feature_names[] = {
   "org.illumos:lz4_compress",
-  "com.delphix:hole_birth",NULL
+  "com.delphix:hole_birth",
+  "com.delphix:extensible_dataset",
+  "com.delphix:embedded_data",NULL
 };
 
 static int
@@ -1802,6 +1804,76 @@ zio_read_data (blkptr_t * bp, grub_zfs_endian_t endian, void *buf,
 }
 
 /*
+ * buf must be at least BPE_GET_PSIZE(bp) bytes long (which will never be
+ * more than BPE_PAYLOAD_SIZE bytes).
+ */
+static void
+decode_embedded_bp_compressed (const blkptr_t *bp, void *buf)
+{
+  int psize, i;
+  grub_uint8_t *buf8 = buf;
+  grub_uint64_t w = 0;
+  const grub_uint64_t *bp64 = (const grub_uint64_t *)bp;
+
+  psize = BPE_GET_PSIZE(bp);
+
+  /*
+   * Decode the words of the block pointer into the byte array.
+   * Low bits of first word are the first byte (little endian).
+   */
+  for (i = 0; i < psize; i++)
+    {
+      if (i % sizeof (w) == 0)
+        {
+          /* beginning of a word */
+          w = *bp64;
+          bp64++;
+          if (!BPE_IS_PAYLOADWORD(bp, bp64))
+            bp64++;
+        }
+     buf8[i] = BF64_GET(w, (i % sizeof (w)) * 8, 8);
+    }
+}
+
+/*
+ * Fill in the buffer with the (decompressed) payload of the embedded
+ * blkptr_t.  Takes into account compression and byteorder (the payload is
+ * treated as a stream of bytes).
+ * Return 0 on success, or ENOSPC if it won't fit in the buffer.
+ */
+static int
+decode_embedded_bp(const blkptr_t *bp, void **buf)
+{
+  int comp;
+  int lsize, psize;
+  grub_uint8_t *dst;
+
+  lsize = BPE_GET_LSIZE(bp);
+  psize = BPE_GET_PSIZE(bp);
+  comp = BP_GET_COMPRESS(bp);
+
+  dst = *buf = grub_malloc (lsize);
+
+  if (comp != ZIO_COMPRESS_OFF)
+    {
+      grub_uint8_t dstbuf[BPE_PAYLOAD_SIZE];
+
+      if ((unsigned int)comp >= ZIO_COMPRESS_FUNCTIONS ||
+        decomp_table[comp].decomp_func == NULL)
+        return grub_error (GRUB_ERR_NOT_IMPLEMENTED_YET,
+          "compression algorithm not supported\n");
+
+      decode_embedded_bp_compressed(bp, dstbuf);
+      decomp_table[comp].decomp_func(dstbuf, dst, psize, lsize);
+    }
+  else
+    {
+      decode_embedded_bp_compressed(bp, dst);
+    }
+  return (0);
+}
+
+/*
  * Read in a block of data, verify its checksum, decompress if needed,
  * and put the uncompressed data in buf.
  */
@@ -1817,6 +1889,14 @@ zio_read (blkptr_t *bp, grub_zfs_endian_t endian, void **buf,
   grub_uint32_t checksum;
 
   *buf = NULL;
+
+  if (BP_IS_EMBEDDED(bp))
+    {
+      if (BPE_GET_ETYPE(bp) != BP_EMBEDDED_TYPE_DATA)
+          return grub_error (GRUB_ERR_NOT_IMPLEMENTED_YET,
+            "unsupported embedded BP (type=%u)\n", (int)BPE_GET_ETYPE(bp));
+    return decode_embedded_bp(bp, buf);
+    }
 
   checksum = (grub_zfs_to_cpu64((bp)->blk_prop, endian) >> 40) & 0xff;
   comp = (grub_zfs_to_cpu64((bp)->blk_prop, endian)>>32) & 0xff;
@@ -4195,7 +4275,7 @@ check_feature (const char *name, grub_uint64_t val,
     return 0;
   if (name[0] == 0)
     return 0;
-  for (i = 0; spa_feature_names[i] != NULL; i++) 
+  for (i = 0; spa_feature_names[i] != NULL; i++)  
     if (grub_strcmp (name, spa_feature_names[i]) == 0) 
       return 0;
   return 1;
